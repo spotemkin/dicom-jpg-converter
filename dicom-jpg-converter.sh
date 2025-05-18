@@ -28,14 +28,30 @@ find . -maxdepth 1 -type d -not -path "*/\.*" -not -name "*-jpg" | while read -r
     echo "Processing directory: $dir_name"
     echo "Output directory: $output_dir"
 
-    # Counter for processed files - using a file to store count
+    # Counter for processed files - using files to store counts
     count_file=$(mktemp)
     echo "0" > "$count_file"
+
+    # Counter for failed conversions
+    failed_count_file=$(mktemp)
+    echo "0" > "$failed_count_file"
+
+    # Temp file to store list of failed files
+    failed_files=$(mktemp)
+
+    # Total files processed
+    total_files_file=$(mktemp)
+    echo "0" > "$total_files_file"
 
     # Find all regular files in the deepest directories
     find "$source_dir" -type f | while read -r file; do
         # Check if file is a DICOM file using file command
         if file "$file" | grep -i "dicom\|medical image" >/dev/null 2>&1; then
+            # Increment total files counter
+            total_files=$(<"$total_files_file")
+            total_files=$((total_files + 1))
+            echo "$total_files" > "$total_files_file"
+
             # Get the relative path within the source directory
             rel_path="${file#$source_dir/}"
             dir_path=$(dirname "$rel_path")
@@ -109,8 +125,11 @@ find . -maxdepth 1 -type d -not -path "*/\.*" -not -name "*-jpg" | while read -r
 
             echo "Converting DICOM to JPG..."
 
-            # Try multiple conversion methods, starting with the most aggressive
-            if dcmtk-dcmj2pnm --write-jpeg --render-all-frames --min-max-window --compr-quality 100 --use-pixel-spacing --scaling-factor 2.0 "$file" "$output_file" 2>/dev/null; then
+            # Try multiple conversion methods with appropriate scale (100% instead of 200%)
+            conversion_success=false
+
+            # Method 1
+            if dcmj2pnm --write-jpeg --render-all-frames --min-max-window --compr-quality 100 --use-pixel-spacing --scaling-factor 1.0 "$file" "$output_file" 2>/dev/null; then
                 # Update counter
                 count=$(<"$count_file")
                 count=$((count + 1))
@@ -120,28 +139,43 @@ find . -maxdepth 1 -type d -not -path "*/\.*" -not -name "*-jpg" | while read -r
                 convert "$output_file" -auto-level -normalize -quality 100 -density 300 "$output_file.tmp" && mv "$output_file.tmp" "$output_file"
 
                 echo "Successfully converted to: $output_file (method 1)"
-            elif gdcm2pnm -i "$file" -o "$output_file" --jpeg 2>/dev/null; then
-                # Update counter - using GDCM if installed
-                count=$(<"$count_file")
-                count=$((count + 1))
-                echo "$count" > "$count_file"
+                conversion_success=true
+            fi
 
-                # Optimize
-                convert "$output_file" -auto-level -normalize -quality 100 -density 300 "$output_file.tmp" && mv "$output_file.tmp" "$output_file"
+            # Method 2
+            if [ "$conversion_success" = false ] && command -v gdcm2pnm >/dev/null 2>&1; then
+                if gdcm2pnm -i "$file" -o "$output_file" --jpeg 2>/dev/null; then
+                    # Update counter - using GDCM if installed
+                    count=$(<"$count_file")
+                    count=$((count + 1))
+                    echo "$count" > "$count_file"
 
-                echo "Successfully converted to: $output_file (method 2 - GDCM)"
-            elif dcmj2pnm +Wm +oj "$file" "$output_file" 2>/dev/null; then
-                # Update counter
-                count=$(<"$count_file")
-                count=$((count + 1))
-                echo "$count" > "$count_file"
+                    # Optimize
+                    convert "$output_file" -auto-level -normalize -quality 100 -density 300 "$output_file.tmp" && mv "$output_file.tmp" "$output_file"
 
-                # Optimize
-                convert "$output_file" -auto-level -normalize -quality 100 -density 300 "$output_file.tmp" && mv "$output_file.tmp" "$output_file"
+                    echo "Successfully converted to: $output_file (method 2 - GDCM)"
+                    conversion_success=true
+                fi
+            fi
 
-                echo "Successfully converted to: $output_file (method 3)"
-            else
-                # Last resort - force conversion with ImageMagick directly
+            # Method 3
+            if [ "$conversion_success" = false ]; then
+                if dcmj2pnm +Wm +oj "$file" "$output_file" 2>/dev/null; then
+                    # Update counter
+                    count=$(<"$count_file")
+                    count=$((count + 1))
+                    echo "$count" > "$count_file"
+
+                    # Optimize
+                    convert "$output_file" -auto-level -normalize -quality 100 -density 300 "$output_file.tmp" && mv "$output_file.tmp" "$output_file"
+
+                    echo "Successfully converted to: $output_file (method 3)"
+                    conversion_success=true
+                fi
+            fi
+
+            # Method 4 - Last resort
+            if [ "$conversion_success" = false ]; then
                 convert "$file" -auto-level -normalize -quality 100 -density 300 "$output_file" 2>/dev/null
 
                 if [ -f "$output_file" ] && [ -s "$output_file" ]; then
@@ -151,7 +185,14 @@ find . -maxdepth 1 -type d -not -path "*/\.*" -not -name "*-jpg" | while read -r
                     echo "$count" > "$count_file"
 
                     echo "Successfully converted to: $output_file (method 4 - ImageMagick direct)"
+                    conversion_success=true
                 else
+                    # Update failed counter and log the failed file
+                    failed_count=$(<"$failed_count_file")
+                    failed_count=$((failed_count + 1))
+                    echo "$failed_count" > "$failed_count_file"
+                    echo "$file" >> "$failed_files"
+
                     echo "WARNING: Could not convert $file to JPG after multiple attempts"
                     echo "WARNING: This DICOM file may not contain image data"
                     echo "Note: Metadata has been extracted to $metadata_file"
@@ -163,13 +204,41 @@ find . -maxdepth 1 -type d -not -path "*/\.*" -not -name "*-jpg" | while read -r
         fi
     done
 
-    # Get final count
+    # Get final counts
+    total_files=$(<"$total_files_file")
     total_converted=$(<"$count_file")
-    rm "$count_file"
+    total_failed=$(<"$failed_count_file")
+
+    # Create summary file
+    summary_file="$output_dir/conversion_summary.txt"
+    echo "DICOM to JPG Conversion Summary" > "$summary_file"
+    echo "===============================" >> "$summary_file"
+    echo "Date: $(date)" >> "$summary_file"
+    echo "Source directory: $dir_name" >> "$summary_file"
+    echo "Output directory: $output_dir" >> "$summary_file"
+    echo "" >> "$summary_file"
+    echo "Total DICOM files found: $total_files" >> "$summary_file"
+    echo "Successfully converted: $total_converted" >> "$summary_file"
+    echo "Failed conversions: $total_failed" >> "$summary_file"
+    echo "" >> "$summary_file"
+
+    if [ "$total_failed" -gt 0 ]; then
+        echo "Files that failed to convert:" >> "$summary_file"
+        echo "----------------------------" >> "$summary_file"
+        cat "$failed_files" >> "$summary_file"
+    fi
 
     echo "Completed processing directory: $dir_name"
-    echo "Total images converted: $total_converted"
+    echo "Total DICOM files found: $total_files"
+    echo "Successfully converted: $total_converted"
+    echo "Failed conversions: $total_failed"
+    if [ "$total_failed" -gt 0 ]; then
+        echo "Details about failed conversions can be found in: $summary_file"
+    fi
     echo "------------------------------------"
+
+    # Clean up temp files
+    rm "$count_file" "$failed_count_file" "$failed_files" "$total_files_file"
 done
 
 echo "All conversions completed!"

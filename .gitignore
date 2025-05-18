@@ -1,0 +1,23 @@
+# Environment variables
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env/
+.venv/
+old/
+# Logs
+*.log
+
+# Session files
+*.session
+
+# system scripts
+*.sh
+*.not

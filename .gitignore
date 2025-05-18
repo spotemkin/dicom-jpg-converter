@@ -19,5 +19,4 @@ old/
 *.session
 
 # system scripts
-*.sh
 *.not
